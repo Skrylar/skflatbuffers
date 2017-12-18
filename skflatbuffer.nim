@@ -1,4 +1,6 @@
 
+import math
+
 type
   uoffset* = uint32           ## offset in to the buffer
   soffset* = int32            ## offset from start of table, to a vtable
@@ -12,6 +14,7 @@ type
 
 const
   ENotEnoughBytes = "Not enough bytes to read from."
+  MaxStringReadSize = 8192 # safety against lazy coders and ram limits
 
 # NOTE: the offset from the start of a struct is actually inverse; the offset is how many bytes BEHIND the struct to find the vtable, so a negative value goes forward
 
@@ -43,7 +46,7 @@ proc raw_add*[T:Primitive](buffer: var seq[uint8], x: T): uoffset =
   y[] = x                       # XXX assumes little-endian
   return bmk.uoffset
 
-proc raw_add_string*(buffer: var seq[uint8], str: string): uoffset =
+proc raw_add*(buffer: var seq[uint8], str: string): uoffset =
   ## Appends a string to a byte buffer.
   discard buffer.raw_add(buffer.len.uoffset)
   let bmk = buffer.len
@@ -84,6 +87,19 @@ proc raw_read*[T:Primitive](buffer: seq[uint8]; offset: int): T =
     raise new_exception(IndexError, ENotEnoughBytes)
   movemem(cast[pointer](unsafeaddr result), cast[pointer](unsafeaddr buffer[offset]), T.sizeof)
 
+proc raw_read_string*(buffer: seq[uint8]; offset: int; max_size: int = MaxStringReadSize): string =
+  # read string length
+  var strlen = raw_read[uoffset](buffer, offset).int
+  if (offset + uoffset.sizeof + strlen) > buffer.len:
+    raise new_exception(IndexError, ENotEnoughBytes)
+
+  # apply the safety
+  strlen = min(strlen.int, max_size.int)
+
+  result = newstring(strlen)
+  movemem(cast[pointer](unsafeaddr result[0]), cast[pointer](unsafeaddr buffer[offset + uoffset.sizeof]), strlen)
+
+
 proc vtcount*(buffer: seq[uint8]; offset: int): int =
   ## Calculates the number of offsets in the vtable at offset.
   if offset + (voffset.sizeof * 2) > buffer.len:
@@ -108,7 +124,7 @@ when isMainModule:
 
     test "Adding strings doesn't boom":
         var buff: seq[uint8] = @[]
-        discard buff.raw_add_string("exploded kittens")
+        discard buff.raw_add("exploded kittens")
 
     test "Adding bytes doesn't boom":
         var buff: seq[uint8] = @[]
@@ -129,8 +145,16 @@ when isMainModule:
         var buff: seq[uint8] = @[]
         discard buff.raw_add(vt)
 
-    suite "Virtual tables":
-      test "Element Counts":
+    suite "Reading":
+      test "Strings":
+        var buff: seq[uint8] = @[]
+        discard buff.raw_add("pine cones")
+
+        checkpoint "written string"
+
+        check raw_read_string(buff, 0) == "pine cones"
+
+      test "VTable Element Counts":
         var vt = Vtable()
         vt.add(int32)
         vt.add(uint32)
