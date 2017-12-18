@@ -10,10 +10,11 @@ type
 
   Vtable* = object ## helper when dealing with schemas at runtiem
     struct_size*: int           ## how big is the structure?
-    offsets*: seq[soffset]      ## how many (and what) are the offsets?
+    offsets*: seq[voffset]      ## how many (and what) are the offsets?
 
 const
   ENotEnoughBytes = "Not enough bytes to read from."
+  ENotInVtable = "VTable does not contain this entry."
   MaxStringReadSize = 8192 # safety against lazy coders and ram limits
 
 # NOTE: the offset from the start of a struct is actually inverse; the offset is how many bytes BEHIND the struct to find the vtable, so a negative value goes forward
@@ -30,13 +31,13 @@ template add*(self: var Vtable; where: voffset; T: typed) =
     newseq(self.offsets, 0)
   self.offsets.add(where)
 
-template `[]=`*(self: var Vtable; index: int; offset: voffset) =
+template `[]=`*(self: Vtable; index: int; offset: voffset) =
   self.offsets[index] = offset
 
 proc scrub*(self: var Vtable) =
   ## Sets the offsets to zero, as though the fields still exist but hold no values.
   for i in 0..self.offsets.high:
-    self.offsets[i] = 0.soffset
+    self.offsets[i] = 0.voffset
 
 proc raw_add*[T:Primitive](buffer: var seq[uint8], x: T): uoffset =
   ## Append some primitive nim type to a byte buffer.
@@ -72,18 +73,14 @@ proc raw_add*(buffer: var seq[uint8]; vt: Vtable): uoffset =
   let offset_count = if vt.offsets != nil: vt.offsets.len else: 0
   let vtsize = (voffset.sizeof * (2 + offset_count))
 
-  # XXX we are making sure the cap is preallocated
-  setlen(buffer, bmk + vtsize)
-  setlen(buffer, bmk)
-
-  discard raw_add(buffer, vtsize.voffset)
-  discard raw_add(buffer, vt.struct_size)
+  result = raw_add[voffset](buffer, vtsize.voffset).uoffset
+  discard raw_add[voffset](buffer, (vt.struct_size + soffset.sizeof).voffset)
 
   # now we need the space again :/
   setlen(buffer, bmk + vtsize)
 
   # blit offsets
-  movemem(cast[pointer](addr buffer[bmk + (voffset.sizeof * 2)]), cast[pointer](unsafeaddr vt.offsets[0]), voffset.sizeof * vt.offsets.len)
+  movemem(cast[pointer](addr buffer[bmk + (voffset.sizeof * 2)]), cast[pointer](unsafeaddr vt.offsets[0]), voffset.sizeof * offset_count)
 
 proc raw_read*[T:Primitive](buffer: seq[uint8]; offset: int): T =
   # XXX no idea if -d:release turns off bounds checks; in the event that it might, we need to make sure to intentionally bounds check as we are in the danger zone here
@@ -110,6 +107,15 @@ proc vtcount*(buffer: seq[uint8]; offset: int): int =
 
   var vtable_size = raw_read[voffset](buffer, offset)
   result = ((vtable_size /% voffset.sizeof).int) - 2
+
+proc resolve*(buffer: seq[uint8]; offset, element: int): int =
+  ## Assuming a table is at 'offset', follow the vtable pointer.  Try to find the numbered element (starting from zero) in the vtable.  Returns the buffer location the desired value can be read.
+  var vloc = offset - raw_read[soffset](buffer, offset) # yes, this offset is subtracted; read the spec
+  var count = vtcount(buffer, vloc)
+  if element < 0 or element >= count:
+    raise new_exception(IndexError, ENotInVtable)
+  let soff = raw_read[voffset](buffer, vloc + (voffset.sizeof * (2 + element)))
+  result = offset + soff
 
 when isMainModule:
   import unittest, streams
@@ -157,6 +163,39 @@ when isMainModule:
 
         check raw_read[uoffset](buff, 0) == 10
         check read_string(buff, 0) == "pine cones"
+
+      test "Resolving Element Positions":
+        var vt = Vtable()
+        vt.add(int32)
+        vt.add(int32)
+
+        # its possible to calculate this in advance, although the
+        # values CAN be literally anywhere.  there is no requirement
+        # for the layout of your tables make any sense whatsoever.
+        vt[0] = soffset.sizeof.voffset
+        vt[1] = (soffset.sizeof + int32.sizeof).voffset
+
+        var buff: seq[uint8] = @[]
+        discard buff.raw_add(vt)
+
+        check buff.len == 8
+
+        checkpoint "wrote vtable"
+
+        let tpos = raw_add(buff, buff.len.soffset) # write offset to vtable
+        let b1 = raw_add(buff, 42.int32)   # and both values
+        let b2 = raw_add(buff, 24.int32)
+
+        check b1 == 12
+        check b2 == 16
+
+        check buff.len == 20
+
+        check resolve(buff, tpos.int, 0) == b1.int
+        check resolve(buff, tpos.int, 1) == b2.int
+
+        expect(IndexError):
+          discard resolve(buff, tpos.int, 2)
 
       test "VTable Element Counts":
         var vt = Vtable()
