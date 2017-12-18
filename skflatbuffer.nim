@@ -10,6 +10,11 @@ type
     struct_size*: int           ## how big is the structure?
     offsets*: seq[soffset]      ## how many (and what) are the offsets?
 
+const
+  ENotEnoughBytes = "Not enough bytes to read from."
+
+# NOTE: the offset from the start of a struct is actually inverse; the offset is how many bytes BEHIND the struct to find the vtable, so a negative value goes forward
+
 template add*(self: var Vtable; T: typed) =
   inc self.struct_size, T.sizeof
   if self.offsets == nil:
@@ -73,6 +78,20 @@ proc raw_add*(buffer: var seq[uint8]; vt: Vtable): uoffset =
   # blit offsets
   movemem(cast[pointer](addr buffer[bmk + (voffset.sizeof * 2)]), cast[pointer](unsafeaddr vt.offsets[0]), voffset.sizeof * vt.offsets.len)
 
+proc raw_read*[T:Primitive](buffer: seq[uint8]; offset: int): T =
+  # XXX no idea if -d:release turns off bounds checks; in the event that it might, we need to make sure to intentionally bounds check as we are in the danger zone here
+  if offset < 0 or (offset + T.sizeof) > buffer.high:
+    raise new_exception(IndexError, ENotEnoughBytes)
+  movemem(cast[pointer](unsafeaddr result), cast[pointer](unsafeaddr buffer[offset]), T.sizeof)
+
+proc vtcount*(buffer: seq[uint8]; offset: int): int =
+  ## Calculates the number of offsets in the vtable at offset.
+  if offset + (voffset.sizeof * 2) > buffer.len:
+    raise new_exception(IndexError, ENotEnoughBytes)
+
+  var vtable_size = raw_read[voffset](buffer, offset)
+  result = ((vtable_size /% voffset.sizeof).int) - 2
+
 when isMainModule:
   import unittest, streams
 
@@ -109,6 +128,23 @@ when isMainModule:
 
         var buff: seq[uint8] = @[]
         discard buff.raw_add(vt)
+
+    suite "Virtual tables":
+      test "Element Counts":
+        var vt = Vtable()
+        vt.add(int32)
+        vt.add(uint32)
+
+        check vt.offsets.len == 2
+
+        checkpoint "created virtual table"
+
+        var buff: seq[uint8] = @[]
+        discard buff.raw_add(vt)
+
+        checkpoint "serialized vtable"
+
+        check vtcount(buff, 0) == 2
 
   #junit.close()
   #junitfile.flush()
