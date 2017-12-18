@@ -4,8 +4,7 @@ type
   soffset* = int32            ## offset from start of table, to a vtable
   voffset* = int16            ## offset from start of table to value
 
-  SomeOffset* = uoffset | soffset | voffset
-  Primitive* = SomeOffset | SomeNumber | char | bool ## for generics
+  Primitive* = SomeNumber | char | bool ## for generics
 
   Vtable* = object ## helper when dealing with schemas at runtiem
     struct_size*: int           ## how big is the structure?
@@ -22,6 +21,14 @@ template add*(self: var Vtable; where: voffset; T: typed) =
   if self.offsets == nil:
     newseq(self.offsets, 0)
   self.offsets.add(where)
+
+template `[]=`*(self: var Vtable; index: int; offset: voffset) =
+  self.offsets[index] = offset
+
+proc scrub*(self: var Vtable) =
+  ## Sets the offsets to zero, as though the fields still exist but hold no values.
+  for i in 0..self.offsets.high:
+    self.offsets[i] = 0.soffset
 
 proc raw_add*[T:Primitive](buffer: var seq[uint8], x: T): uoffset =
   ## Append some primitive nim type to a byte buffer.
@@ -67,33 +74,42 @@ proc raw_add*(buffer: var seq[uint8]; vt: Vtable): uoffset =
   movemem(cast[pointer](addr buffer[bmk + (voffset.sizeof * 2)]), cast[pointer](unsafeaddr vt.offsets[0]), voffset.sizeof * vt.offsets.len)
 
 when isMainModule:
-  import unittest
+  import unittest, streams
 
-  test "Adding offsets doesn't boom":
-    var buff: seq[uint8] = @[]
-    discard buff.raw_add(32.uoffset)
-    discard buff.raw_add(32.soffset)
-    discard buff.raw_add(32.voffset)
+  #var junitfile = newfilestream("skflatbuffer.xml", fmwrite)
+  #var junit = newJUnitOutputFormatter(junitfile)
+  #addoutputformatter(junit)
 
-  test "Adding strings doesn't boom":
-    var buff: seq[uint8] = @[]
-    discard buff.raw_add_string("exploded kittens")
+  suite "Basic crash tests":
+    test "Adding offsets doesn't boom":
+        var buff: seq[uint8] = @[]
+        discard buff.raw_add(32.uoffset)
+        discard buff.raw_add(32.soffset)
+        discard buff.raw_add(32.voffset)
 
-  test "Adding bytes doesn't boom":
-    var buff: seq[uint8] = @[]
-    discard buff.raw_add(4'u8)
-    check buff.len == 1
+    test "Adding strings doesn't boom":
+        var buff: seq[uint8] = @[]
+        discard buff.raw_add_string("exploded kittens")
 
-  test "Adding tuples doesn't boom":
-    var buff: seq[uint8] = @[]
-    discard buff.raw_add_inline(int.sizeof.uint, (foo: 3, bar: 6))
-    check buff.len == (int.sizeof * 2)
+    test "Adding bytes doesn't boom":
+        var buff: seq[uint8] = @[]
+        discard buff.raw_add(4'u8)
+        check buff.len == 1
 
-  test "Can create a dynamic vtable":
-    var vt = Vtable()
-    vt.add(int32)
-    vt.add(uint32)
-    check vt.struct_size == (uint32.sizeof + int32.sizeof)
+    test "Adding tuples doesn't boom":
+        var buff: seq[uint8] = @[]
+        discard buff.raw_add_inline(int.sizeof.uint, (foo: 3, bar: 6))
+        check buff.len == (int.sizeof * 2)
 
-    var buff: seq[uint8] = @[]
-    discard buff.raw_add(vt)
+    test "Can create a dynamic vtable":
+        var vt = Vtable()
+        vt.add(int32)
+        vt.add(uint32)
+        check vt.struct_size == (uint32.sizeof + int32.sizeof)
+
+        var buff: seq[uint8] = @[]
+        discard buff.raw_add(vt)
+
+  #junit.close()
+  #junitfile.flush()
+  #junitfile.close()
