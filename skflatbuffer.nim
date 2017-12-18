@@ -47,13 +47,17 @@ proc raw_add*[T:Primitive](buffer: var seq[uint8], x: T): uoffset =
   return bmk.uoffset
 
 proc raw_add*(buffer: var seq[uint8], str: string): uoffset =
-  ## Appends a string to a byte buffer.
-  discard buffer.raw_add(buffer.len.uoffset)
+  ## Appends a string to a byte buffer, including zero terminal.
   let bmk = buffer.len
   setlen(buffer, buffer.len + str.len + 1)
   movemem(cast[pointer](addr buffer[bmk]), cast[pointer](unsafeaddr str[0]), str.len)
   buffer[bmk+str.len] = 0
   return bmk.uoffset
+
+proc add*(buffer: var seq[uint8]; str: string): uoffset =
+  ## Adds a string to a flat buffer, including the length prefix.
+  result = raw_add(buffer, str.len.uoffset)
+  discard raw_add(buffer, str)
 
 proc raw_add_inline*[T](buffer: var seq[uint8], largest_member_size_bytes: uint, x: T): uoffset =
   ## Append some object inline to the buffer; used for internal serialization, or when blitting structs.
@@ -87,7 +91,7 @@ proc raw_read*[T:Primitive](buffer: seq[uint8]; offset: int): T =
     raise new_exception(IndexError, ENotEnoughBytes)
   movemem(cast[pointer](unsafeaddr result), cast[pointer](unsafeaddr buffer[offset]), T.sizeof)
 
-proc raw_read_string*(buffer: seq[uint8]; offset: int; max_size: int = MaxStringReadSize): string =
+proc read_string*(buffer: seq[uint8]; offset: int; max_size: int = MaxStringReadSize): string =
   # read string length
   var strlen = raw_read[uoffset](buffer, offset).int
   if (offset + uoffset.sizeof + strlen) > buffer.len:
@@ -98,7 +102,6 @@ proc raw_read_string*(buffer: seq[uint8]; offset: int; max_size: int = MaxString
 
   result = newstring(strlen)
   movemem(cast[pointer](unsafeaddr result[0]), cast[pointer](unsafeaddr buffer[offset + uoffset.sizeof]), strlen)
-
 
 proc vtcount*(buffer: seq[uint8]; offset: int): int =
   ## Calculates the number of offsets in the vtable at offset.
@@ -148,11 +151,12 @@ when isMainModule:
     suite "Reading":
       test "Strings":
         var buff: seq[uint8] = @[]
-        discard buff.raw_add("pine cones")
+        discard buff.add("pine cones")
 
         checkpoint "written string"
 
-        check raw_read_string(buff, 0) == "pine cones"
+        check raw_read[uoffset](buff, 0) == 10
+        check read_string(buff, 0) == "pine cones"
 
       test "VTable Element Counts":
         var vt = Vtable()
