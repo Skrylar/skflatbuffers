@@ -1,9 +1,26 @@
 
 type
-  uoffset* = uint32           # offset in to the buffer
-  soffset* = int32            # offset from start of table, to a vtable
-  voffset* = int16            # offset from start of table to value
-  Primitive* = SomeNumber | char | bool
+  uoffset* = uint32           ## offset in to the buffer
+  soffset* = int32            ## offset from start of table, to a vtable
+  voffset* = int16            ## offset from start of table to value
+
+  Primitive* = SomeNumber | char | bool ## for generics
+
+  Vtable* = object ## helper when dealing with schemas at runtiem
+    struct_size*: int           ## how big is the structure?
+    offsets*: seq[soffset]      ## how many (and what) are the offsets?
+
+template add*(self: var Vtable; T: typed) =
+  inc self.struct_size, T.sizeof
+  if self.offsets == nil:
+    newseq(self.offsets, 0)
+  self.offsets.add(0)           # just assume the value isn't set
+
+template add*(self: var Vtable; where: voffset; T: typed) =
+  inc self.struct_size, T.sizeof
+  if self.offsets == nil:
+    newseq(self.offsets, 0)
+  self.offsets.add(where)
 
 proc raw_add_offset*(buffer: var seq[uint8], x: uoffset): uoffset =
   ## Appends an offset to a byte buffer.
@@ -58,3 +75,9 @@ when isMainModule:
     var buff: seq[uint8] = @[]
     discard buff.raw_add_inline(int.sizeof.uint, (foo: 3, bar: 6))
     check buff.len == (int.sizeof * 2)
+
+  test "Can create a dynamic vtable":
+    var vt = Vtable()
+    vt.add(int32)
+    vt.add(uint32)
+    check vt.struct_size == (uint32.sizeof + int32.sizeof)
