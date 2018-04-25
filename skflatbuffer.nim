@@ -1,5 +1,5 @@
 
-import math
+import math, macros, typetraits
 
 type
   uoffset* = uint32           ## offset in to the buffer
@@ -10,6 +10,8 @@ type
 
   Vtable* = object ## helper when dealing with schemas at runtiem
     struct_size*: int           ## how big is the structure?
+    embed_size*: int
+    alignment_size*: int        ## largest size of inlined thing
     offsets*: seq[voffset]      ## how many (and what) are the offsets?
 
 const
@@ -19,17 +21,33 @@ const
 
 # NOTE: the offset from the start of a struct is actually inverse; the offset is how many bytes BEHIND the struct to find the vtable, so a negative value goes forward
 
-template add*(self: var Vtable; T: typed) =
-  inc self.struct_size, T.sizeof
-  if self.offsets == nil:
-    newseq(self.offsets, 0)
-  self.offsets.add(0)           # just assume the value isn't set
+macro flatbuffer_embedded_sizeof(typ: typed): int =
+  ## Checks the size of this datatype when inlined in to the flat buffer. A size of zero means the type cannot be inlined. Due to bugs with generics in 0.18, this is a hard coded table of known-good types.
+  case $typ
+  of "int8": int8.sizeof
+  of "int16": int16.sizeof
+  of "int32": int32.sizeof
+  of "int64": int64.sizeof
+  of "uint8": uint8.sizeof
+  of "uint16": uint16.sizeof
+  of "uint32": uint32.sizeof
+  of "uint64": uint64.sizeof
+  of "byte": byte.sizeof
+  of "char": char.sizeof
+  of "float32": float32.sizeof
+  of "float64": float64.sizeof
+  else: 0
 
-template add*(self: var Vtable; where: voffset; T: typed) =
-  inc self.struct_size, T.sizeof
+template add*(self: var Vtable; typ: typed) =
+  add(self, flatbuffer_embedded_sizeof(typ))
+
+proc add*(self: var Vtable; embed_size: int) =
+  inc self.struct_size, soffset.sizeof
+  inc self.embed_size, embed_size
+  self.alignment_size = max(self.alignment_size, embed_size)
   if self.offsets == nil:
     newseq(self.offsets, 0)
-  self.offsets.add(where)
+  self.offsets.add(0)
 
 template `[]=`*(self: Vtable; index: int; offset: voffset) =
   self.offsets[index] = offset
@@ -116,6 +134,26 @@ proc resolve*(buffer: seq[uint8]; offset, element: int): int =
     raise new_exception(IndexError, ENotInVtable)
   let soff = raw_read[voffset](buffer, vloc + (voffset.sizeof * (2 + element)))
   result = offset + soff
+
+macro vtable_for*(something: typed): VTable =
+  var rs = newIdentNode("result")
+  var add = newIdentNode("add")
+  var rdot = newDotExpr(rs, add)
+  var vt = bindSym("VTable")
+  var soz = bindSym("flatbuffer_embedded_sizeof")
+  var holder = newAssignment(rs, newCall(vt))
+
+  var list = newStmtList()
+  list.add(holder)
+
+  var tdef = something.symbol.getImpl()
+
+  for field in tdef[2][2]:
+    list.add(newCall(rdot, newCall(soz, field[1])))
+
+  var fn = newProc(newEmptyNode(), [vt], list, nnkLambda)
+  result = newCall(fn)
+  debugecho repr result
 
 when isMainModule:
   import unittest, streams
@@ -212,6 +250,25 @@ when isMainModule:
         checkpoint "serialized vtable"
 
         check vtcount(buff, 0) == 2
+
+  suite "Automated serialization":
+    type
+      SimpleObject = object
+        bacon: int32
+        name: string
+
+    test "VTable from Object":
+      # prepare the thing we want to store
+      var so = SimpleObject()
+      so.bacon = 400
+      so.name = "A Very Simple Plan"
+
+      # now it needs a vtable
+      var vt = vtable_for(SimpleObject)
+
+      check vt.offsets.len == 2
+      check vt.embed_size == int32.sizeof
+      check vt.struct_size == soffset.sizeof * 2
 
   #junit.close()
   #junitfile.flush()
