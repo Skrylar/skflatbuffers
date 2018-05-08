@@ -1,5 +1,5 @@
 
-import math, macros, typetraits, streams
+import math, macros, typetraits, streams, skmmutils
 
 type
   uoffset* = uint32           ## offset in to the buffer
@@ -189,35 +189,6 @@ proc readFB_VTable* (s: Stream; table: ref VTable) =
 # SECTION
 # Automatic serialization
 
-iterator fields(victim: NimNode): tuple[name, sym: NimNode] =
-  ## Iterates fields of a NimNode, which represent a type definition.
-
-  # sanity tests
-  expectKind(victim, nnkTypeDef)
-  expectKind(victim[2], nnkObjectTy)
-  expectKind(victim[2][2], nnkRecList)
-
-  for i in 0..<victim[2][2].len:
-    let here = victim[2][2][i]
-    expectKind(here, nnkIdentDefs)
-
-    let sym = here[here.len-2]
-
-    for name in here:
-      case name.kind
-      of nnkIdent: # normal field
-        yield (name: name, sym: sym)
-      of nnkPostfix: # public field, `foo*`
-        yield (name: name[1], sym: sym)
-      of nnkPragmaExpr: # field with pragma, `foo {.bar.}`
-        case name[0].kind
-          of nnkIdent:
-            yield (name: name, sym: sym)
-          of nnkPostfix:
-            yield (name: name[0][1], sym: sym)
-          else: break
-      else: break
-
 macro autoFlatbuffersFor* (x: typed): untyped =
   expectKind(x, nnkSym)
 
@@ -300,7 +271,11 @@ when isMainModule:
       w: string
       x, y*: int32
 
+    ArrayDoer = object
+      x: seq[int32]
+
   autoFlatbuffersFor(ThingDoer)
+  #autoFlatbuffersFor(ArrayDoer)
 
   #var junitfile = newfilestream("skflatbuffer.xml", fmwrite)
   #var junit = newJUnitOutputFormatter(junitfile)
@@ -316,6 +291,16 @@ when isMainModule:
       x.y = 500'i32
 
       s.writeFB(x)
+
+    # test "ArrayDoer":
+    #   var s = newFileStream("arraydoer.bin", fmWrite)
+
+    #   var x = ArrayDoer()
+    #   newSeq(x.x, 2)
+    #   x.x[0] = 500
+    #   x.x[1] = 900
+
+    #   s.writeFB(x)
 
   #junit.close()
   #junitfile.flush()
