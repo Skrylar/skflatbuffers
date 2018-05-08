@@ -1,5 +1,5 @@
 
-import math, macros, typetraits
+import math, macros, typetraits, streams
 
 type
   uoffset* = uint32           ## offset in to the buffer
@@ -14,126 +14,64 @@ type
     alignment_size*: int        ## largest size of inlined thing
     offsets*: seq[voffset]      ## how many (and what) are the offsets?
 
-const
-  ENotEnoughBytes = "Not enough bytes to read from."
-  ENotInVtable = "VTable does not contain this entry."
-  MaxStringReadSize = 8192 # safety against lazy coders and ram limits
-
 # NOTE: the offset from the start of a struct is actually inverse; the offset is how many bytes BEHIND the struct to find the vtable, so a negative value goes forward
 
-macro flatbuffer_embedded_sizeof(typ: typed): int =
-  ## Checks the size of this datatype when inlined in to the flat buffer. A size of zero means the type cannot be inlined. Due to bugs with generics in 0.18, this is a hard coded table of known-good types.
-  case $typ
-  of "int8": int8.sizeof
-  of "int16": int16.sizeof
-  of "int32": int32.sizeof
-  of "int64": int64.sizeof
-  of "uint8": uint8.sizeof
-  of "uint16": uint16.sizeof
-  of "uint32": uint32.sizeof
-  of "uint64": uint64.sizeof
-  of "byte": byte.sizeof
-  of "char": char.sizeof
-  of "float32": float32.sizeof
-  of "float64": float64.sizeof
-  else: 0
+# SECTION
+# Creating virtual tables
+
+proc flatbuffer_embedded_sizeof_str*(typ: string): int =
+  ## Checks the size of this datatype when inlined in to the flat buffer. A
+  ## size of zero means the type cannot be inlined. Due to bugs with generics
+  ## in 0.18, this is a hard coded table of known-good types.
+  case typ
+  of "int8": return int8.sizeof
+  of "int16": return int16.sizeof
+  of "int32": return int32.sizeof
+  of "int64": return int64.sizeof
+  of "uint8": return uint8.sizeof
+  of "uint16": return uint16.sizeof
+  of "uint32": return uint32.sizeof
+  of "uint64": return uint64.sizeof
+  of "byte": return byte.sizeof
+  of "char": return char.sizeof
+  of "float32": return float32.sizeof
+  of "float64": return float64.sizeof
+  else: return 0
+
+macro flatbuffer_embedded_sizeof*(typ: typed): int =
+  ## Checks the size of this datatype when inlined in to the flat buffer. A
+  ## size of zero means the type cannot be inlined. Due to bugs with generics
+  ## in 0.18, this is a hard coded table of known-good types.
+  return flatbuffer_embedded_sizeof_str($typ)
 
 template add*(self: var Vtable; typ: typed) =
+  ## Convenience template for adding a type to a virtual table.
   add(self, flatbuffer_embedded_sizeof(typ))
 
 proc add*(self: var Vtable; embed_size: int) =
+  ## Less convenient procedure for adding to a virtual table, including size of embedded value.
+
   inc self.struct_size, soffset.sizeof
-  inc self.embed_size, embed_size
+  
+  # technically something that was not embedded is instead pointed to, so the pointer itself is embedded.
+  if embed_size == 0:
+    inc self.embed_size, uint16.sizeof
+  else:
+    inc self.embed_size, embed_size
+
   self.alignment_size = max(self.alignment_size, embed_size)
   if self.offsets == nil:
     newseq(self.offsets, 0)
   self.offsets.add(0)
 
 template `[]=`*(self: Vtable; index: int; offset: voffset) =
+  ## Easy way to set the offset of a written value.
   self.offsets[index] = offset
 
 proc scrub*(self: var Vtable) =
   ## Sets the offsets to zero, as though the fields still exist but hold no values.
   for i in 0..self.offsets.high:
     self.offsets[i] = 0.voffset
-
-proc raw_add*[T:Primitive](buffer: var seq[uint8], x: T): uoffset =
-  ## Append some primitive nim type to a byte buffer.
-  let bmk = buffer.len
-  setlen(buffer, buffer.len + T.sizeof)
-  var y = cast[ptr T](addr buffer[bmk])
-  y[] = x                       # XXX assumes little-endian
-  return bmk.uoffset
-
-proc raw_add*(buffer: var seq[uint8], str: string): uoffset =
-  ## Appends a string to a byte buffer, including zero terminal.
-  let bmk = buffer.len
-  setlen(buffer, buffer.len + str.len + 1)
-  movemem(cast[pointer](addr buffer[bmk]), cast[pointer](unsafeaddr str[0]), str.len)
-  buffer[bmk+str.len] = 0
-  return bmk.uoffset
-
-proc add*(buffer: var seq[uint8]; str: string): uoffset =
-  ## Adds a string to a flat buffer, including the length prefix.
-  result = raw_add(buffer, str.len.uoffset)
-  discard raw_add(buffer, str)
-
-proc raw_add_inline*[T](buffer: var seq[uint8], largest_member_size_bytes: uint, x: T): uoffset =
-  ## Append some object inline to the buffer; used for internal serialization, or when blitting structs.
-  let padding = buffer.len %% largest_member_size_bytes.int
-  let bmk = buffer.len + padding
-  setlen(buffer, bmk + T.sizeof)
-  movemem(cast[pointer](addr buffer[bmk]), cast[pointer](unsafeaddr x), T.sizeof)
-  return bmk.uoffset
-
-proc raw_add*(buffer: var seq[uint8]; vt: Vtable): uoffset =
-  let bmk = buffer.len
-  let offset_count = if vt.offsets != nil: vt.offsets.len else: 0
-  let vtsize = (voffset.sizeof * (2 + offset_count))
-
-  result = raw_add[voffset](buffer, vtsize.voffset).uoffset
-  discard raw_add[voffset](buffer, (vt.struct_size + soffset.sizeof).voffset)
-
-  # now we need the space again :/
-  setlen(buffer, bmk + vtsize)
-
-  # blit offsets
-  movemem(cast[pointer](addr buffer[bmk + (voffset.sizeof * 2)]), cast[pointer](unsafeaddr vt.offsets[0]), voffset.sizeof * offset_count)
-
-proc raw_read*[T:Primitive](buffer: seq[uint8]; offset: int): T =
-  # XXX no idea if -d:release turns off bounds checks; in the event that it might, we need to make sure to intentionally bounds check as we are in the danger zone here
-  if offset < 0 or (offset + T.sizeof) > buffer.high:
-    raise new_exception(IndexError, ENotEnoughBytes)
-  movemem(cast[pointer](unsafeaddr result), cast[pointer](unsafeaddr buffer[offset]), T.sizeof)
-
-proc read_string*(buffer: seq[uint8]; offset: int; max_size: int = MaxStringReadSize): string =
-  # read string length
-  var strlen = raw_read[uoffset](buffer, offset).int
-  if (offset + uoffset.sizeof + strlen) > buffer.len:
-    raise new_exception(IndexError, ENotEnoughBytes)
-
-  # apply the safety
-  strlen = min(strlen.int, max_size.int)
-
-  result = newstring(strlen)
-  movemem(cast[pointer](unsafeaddr result[0]), cast[pointer](unsafeaddr buffer[offset + uoffset.sizeof]), strlen)
-
-proc vtcount*(buffer: seq[uint8]; offset: int): int =
-  ## Calculates the number of offsets in the vtable at offset.
-  if offset + (voffset.sizeof * 2) > buffer.len:
-    raise new_exception(IndexError, ENotEnoughBytes)
-
-  var vtable_size = raw_read[voffset](buffer, offset)
-  result = ((vtable_size /% voffset.sizeof).int) - 2
-
-proc resolve*(buffer: seq[uint8]; offset, element: int): int =
-  ## Assuming a table is at 'offset', follow the vtable pointer.  Try to find the numbered element (starting from zero) in the vtable.  Returns the buffer location the desired value can be read.
-  var vloc = offset - raw_read[soffset](buffer, offset) # yes, this offset is subtracted; read the spec
-  var count = vtcount(buffer, vloc)
-  if element < 0 or element >= count:
-    raise new_exception(IndexError, ENotInVtable)
-  let soff = raw_read[voffset](buffer, vloc + (voffset.sizeof * (2 + element)))
-  result = offset + soff
 
 macro vtable_for*(something: typed): VTable =
   var rs = newIdentNode("result")
@@ -153,122 +91,231 @@ macro vtable_for*(something: typed): VTable =
 
   var fn = newProc(newEmptyNode(), [vt], list, nnkLambda)
   result = newCall(fn)
-  debugecho repr result
+
+# SECTION
+# Writing datums
+
+proc writeFB* (s: Stream; str: string) =
+  s.write(str.len.uint32)
+  s.write(str)
+  s.write(0.uint8) # implicit null terminator; required by spec
+
+proc writeFB* (s: Stream; b: pointer; bs: int) =
+  s.write(bs.uint32)
+  s.writeData(b, bs)
+  s.write(0.uint8) # implicit null terminator; required by spec
+
+# SECTION
+# Reading datums
+
+proc readFBString* (s: Stream): string =
+  ## NB: This procedure does not involve a read limit; specially crafted
+  ## inputs could request all available memory be allocated.
+  
+  var slen = s.readUint32().int
+  result = s.readStr(slen).string
+  discard s.readUint8() # implicit null terminator; required by spec
+
+proc readFBData* (s: Stream; b: pointer; bs: int): int =
+  ## NB: You may want to use `peekUint32` to determine the size of the data
+  ## actually on the wire. XXX does not yet handle attempts to read more or
+  ## less than is available intelligently.
+
+  assert bs.uint32 == s.readUint32() # we don't care about the field size here
+  result = s.readData(b, bs)
+  discard s.readUint8() # implicit null terminator; required by spec
+
+# SECTION
+# Writing virtual tables
+
+proc writeFB* (s: Stream; table: ref VTable) =
+  ## Writes a virtual table to an output stream.
+
+  s.write(((table.offsets.len + 2) * uint16.sizeof).uint16) # size of vtable, including size field and embed field
+  s.write((table.embed_size + soffset.sizeof).uint16) # size of embedded data, including vtable offset
+  for field in table.offsets:
+    s.write(field.uint16)
+
+proc writeEmbeddedFB* (stream: Stream; value: int8) =
+  ## Boilerplate for writing a int8 during flat buffer serialization.
+  stream.write(value)
+proc writeEmbeddedFB* (stream: Stream; value: uint8) =
+  ## Boilerplate for writing a uint8 during flat buffer serialization.
+  stream.write(value)
+proc writeEmbeddedFB* (stream: Stream; value: int16) =
+  ## Boilerplate for writing a int16 during flat buffer serialization.
+  stream.write(value)
+proc writeEmbeddedFB* (stream: Stream; value: uint16) =
+  ## Boilerplate for writing a uint16 during flat buffer serialization.
+  stream.write(value)
+proc writeEmbeddedFB* (stream: Stream; value: int32) =
+  ## Boilerplate for writing a int32 during flat buffer serialization.
+  stream.write(value)
+proc writeEmbeddedFB* (stream: Stream; value: uint32) =
+  ## Boilerplate for writing a uint32 during flat buffer serialization.
+  stream.write(value)
+proc writeEmbeddedFB* (stream: Stream; value: int64) =
+  ## Boilerplate for writing a int64 during flat buffer serialization.
+  stream.write(value)
+proc writeEmbeddedFB* (stream: Stream; value: uint64) =
+  ## Boilerplate for writing a uint64 during flat buffer serialization.
+  stream.write(value)
+proc writeEmbeddedFB* (stream: Stream; value: float32) =
+  ## Boilerplate for writing a float32 during flat buffer serialization.
+  stream.write(value)
+proc writeEmbeddedFB* (stream: Stream; value: float64) =
+  ## Boilerplate for writing a float64 during flat buffer serialization.
+  stream.write(value)
+
+# SECTION
+# Reading virtual tables
+
+proc readFB_VTable* (s: Stream; table: ref VTable) =
+  # Reads a virtual table from the stream, matching metadata against the
+  # supplied table. You must provide a virtual table which already knows how
+  # many fields should be read. This procedure takes care of checking expected
+  # field count against known field count, possibly throwing an error. It also
+  # takes care of loading field offsets.
+
+  # gather size of the table to read, and embedded data length
+  var size = s.readUint16().int # TODO maybe bother someone if these don't match expectation
+  discard s.readUint16() # TODO maybe bother someone if these don't match expectation
+  # infer number of fields by offset count
+  var fieldCount = (size - (uint16.sizeof * 2)) /% uint16.sizeof
+  # now read offsets
+  for i in 0..<min(fieldCount, table.offsets.len):
+    table.offsets[i] = s.readUint16().voffset
+
+# SECTION
+# Automatic serialization
+
+iterator fields(victim: NimNode): tuple[name, sym: NimNode] =
+  ## Iterates fields of a NimNode, which represent a type definition.
+
+  # sanity tests
+  expectKind(victim, nnkTypeDef)
+  expectKind(victim[2], nnkObjectTy)
+  expectKind(victim[2][2], nnkRecList)
+
+  for i in 0..<victim[2][2].len:
+    let here = victim[2][2][i]
+    expectKind(here, nnkIdentDefs)
+
+    let sym = here[here.len-2]
+
+    for name in here:
+      case name.kind
+      of nnkIdent: # normal field
+        yield (name: name, sym: sym)
+      of nnkPostfix: # public field, `foo*`
+        yield (name: name[1], sym: sym)
+      of nnkPragmaExpr: # field with pragma, `foo {.bar.}`
+        case name[0].kind
+          of nnkIdent:
+            yield (name: name, sym: sym)
+          of nnkPostfix:
+            yield (name: name[0][1], sym: sym)
+          else: break
+      else: break
+
+macro autoFlatbuffersFor* (x: typed): untyped =
+  expectKind(x, nnkSym)
+
+  var istream = newIdentNode("stream")
+  var sstream = bindSym("Stream")
+  var swrite = newIdentNode("write")
+  var swritefb = newIdentNode("writeFB")
+  var swritefbembed = newIdentNode("writeEmbeddedFB")
+  var sgetPosition = newIdentNode("getPosition")
+  var iself = newIdentNode("self")
+  var sint16 = newIdentNode("int16")
+  var sint32 = newIdentNode("int32")
+
+  var writebody = newStmtList()
+
+  var marks = newStmtList()
+  var minus = newIdentNode("-")
+
+  var vtable_size = int16.sizeof * 2
+  var table_size = int32.sizeof
+  for name, sym in fields(x.symbol.getImpl()):
+    let embed_size = flatbuffer_embedded_sizeof_str($sym)
+    inc vtable_size, int16.sizeof
+    if embed_size > 0:
+      inc table_size, embed_size
+    else:
+      inc table_size, int16.sizeof
+
+  # iterate fields and write everything we cannot embed
+  for name, sym in fields(x.symbol.getImpl()):
+    let embed_size = flatbuffer_embedded_sizeof_str($sym)
+    if embed_size == 0:
+      let marker = newLetStmt(gensym(), newCall(sgetPosition, istream))
+      marks.add(marker)
+      writebody.add(marker)
+      writebody.add(newCall(swritefb, istream, newDotExpr(iself, name)))
+
+  # write the pointer to our vtable 
+  let table_marker = gensym()
+  writebody.add(newLetStmt(table_marker, newCall(sgetPosition, istream)))
+  writebody.add(newCall(swrite, istream, newDotExpr(newLit(-table_size), sint32)))
+
+  # iterate fields and write references to unembedded data, and any data which
+  # has been embedded
+  var y = 0
+  for name, sym in fields(x.symbol.getImpl()):
+    let embed_size = flatbuffer_embedded_sizeof_str($sym)
+    if embed_size > 0:
+      writebody.add(newCall(swritefbembed, istream, newDotExpr(iself, name)))
+    else:
+      writebody.add(newCall(swrite, istream, newDotExpr(newCall(minus, marks[y][0][0], table_marker), sint16)))
+      inc y
+
+  # now we must manufacture the vtable for this object
+  writebody.add(newCall(swrite, istream, newDotExpr(newLit(vtable_size), sint16)))
+  writebody.add(newCall(swrite, istream, newDotExpr(newLit(table_size), sint16)))
+ 
+  y = soffset.sizeof # skip the pointer to vtable
+  for name, sym in fields(x.symbol.getImpl()):
+    let embed_size = flatbuffer_embedded_sizeof_str($sym)
+    writebody.add(newCall(swrite, istream, newDotExpr(newLit(y), sint16)))
+    if embed_size > 0:
+      inc y, embed_size
+    else:
+      inc y, int16.sizeof
+
+  var writeproc = newProc(swritefb,
+    [newEmptyNode(), newIdentDefs(istream, sstream), newIdentDefs(iself, x)],
+    writebody)
+
+  return writeproc
 
 when isMainModule:
   import unittest, streams
+
+  type
+    ThingDoer = object
+      name*: string
+      i, j: int32
+      w: string
+      x, y*: int32
+
+  autoFlatbuffersFor(ThingDoer)
 
   #var junitfile = newfilestream("skflatbuffer.xml", fmwrite)
   #var junit = newJUnitOutputFormatter(junitfile)
   #addoutputformatter(junit)
 
-  suite "Basic crash tests":
-    test "Adding offsets doesn't boom":
-        var buff: seq[uint8] = @[]
-        discard buff.raw_add(32.uoffset)
-        discard buff.raw_add(32.soffset)
-        discard buff.raw_add(32.voffset)
+  suite "Automatic serialization":
+    test "ThingDoer":
+      var s = newFileStream("thingdoer.bin", fmWrite)
 
-    test "Adding strings doesn't boom":
-        var buff: seq[uint8] = @[]
-        discard buff.raw_add("exploded kittens")
+      var x = ThingDoer()
+      x.name = "Test Object"
+      x.w = "<(^_^<)"
+      x.y = 500'i32
 
-    test "Adding bytes doesn't boom":
-        var buff: seq[uint8] = @[]
-        discard buff.raw_add(4'u8)
-        check buff.len == 1
-
-    test "Adding tuples doesn't boom":
-        var buff: seq[uint8] = @[]
-        discard buff.raw_add_inline(int.sizeof.uint, (foo: 3, bar: 6))
-        check buff.len == (int.sizeof * 2)
-
-    test "Can create a dynamic vtable":
-        var vt = Vtable()
-        vt.add(int32)
-        vt.add(uint32)
-        check vt.struct_size == (uint32.sizeof + int32.sizeof)
-
-        var buff: seq[uint8] = @[]
-        discard buff.raw_add(vt)
-
-    suite "Reading":
-      test "Strings":
-        var buff: seq[uint8] = @[]
-        discard buff.add("pine cones")
-
-        checkpoint "written string"
-
-        check raw_read[uoffset](buff, 0) == 10
-        check read_string(buff, 0) == "pine cones"
-
-      test "Resolving Element Positions":
-        var vt = Vtable()
-        vt.add(int32)
-        vt.add(int32)
-
-        # its possible to calculate this in advance, although the
-        # values CAN be literally anywhere.  there is no requirement
-        # for the layout of your tables make any sense whatsoever.
-        vt[0] = soffset.sizeof.voffset
-        vt[1] = (soffset.sizeof + int32.sizeof).voffset
-
-        var buff: seq[uint8] = @[]
-        discard buff.raw_add(vt)
-
-        check buff.len == 8
-
-        checkpoint "wrote vtable"
-
-        let tpos = raw_add(buff, buff.len.soffset) # write offset to vtable
-        let b1 = raw_add(buff, 42.int32)   # and both values
-        let b2 = raw_add(buff, 24.int32)
-
-        check b1 == 12
-        check b2 == 16
-
-        check buff.len == 20
-
-        check resolve(buff, tpos.int, 0) == b1.int
-        check resolve(buff, tpos.int, 1) == b2.int
-
-        expect(IndexError):
-          discard resolve(buff, tpos.int, 2)
-
-      test "VTable Element Counts":
-        var vt = Vtable()
-        vt.add(int32)
-        vt.add(uint32)
-
-        check vt.offsets.len == 2
-
-        checkpoint "created virtual table"
-
-        var buff: seq[uint8] = @[]
-        discard buff.raw_add(vt)
-
-        checkpoint "serialized vtable"
-
-        check vtcount(buff, 0) == 2
-
-  suite "Automated serialization":
-    type
-      SimpleObject = object
-        bacon: int32
-        name: string
-
-    test "VTable from Object":
-      # prepare the thing we want to store
-      var so = SimpleObject()
-      so.bacon = 400
-      so.name = "A Very Simple Plan"
-
-      # now it needs a vtable
-      var vt = vtable_for(SimpleObject)
-
-      check vt.offsets.len == 2
-      check vt.embed_size == int32.sizeof
-      check vt.struct_size == soffset.sizeof * 2
+      s.writeFB(x)
 
   #junit.close()
   #junitfile.flush()
