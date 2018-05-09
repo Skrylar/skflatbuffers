@@ -1,0 +1,154 @@
+
+== Spec files
+
+Many Muffins does not use specification files (.proto, .thrift, etc). It
+relies instead on compile time reflection within Nim and user supplied
+pragmas.
+
+== Overhead
+
+Each format supported only requires a few hundred lines of Nim code.
+Additionally, code which is common to all formats is refactored to a shared
+module and formats themselves are in optional modules.  With dead code
+elimination, small programs which only one one or two formats do not pay a
+significant overhead. Contrast this with many pre-compiled options, that
+require up to hundreds of kilobytes of boilerplate code.
+
+Many Muffins does not *require* an interim representation of objects. Data is
+read directly from annotated domain objects in Nim code and "dumped." Reading
+works in the reverse order; you may opt to clear a domain object and read new
+data in, or simply read new data in directly to merge it with existing values.
+
+== Zero-copy Decoding
+
+While some supported formats allow zero-copy decoding, Many Muffins does rely
+on copying during decoding.
+
+.Rationale
+****
+Zero-copy requires you to handle data through either pointers
+(which might dangle) or slice objects (which are inherently incompatible with
+existing libraries). It is only valuable when handling large binary blobs and
+strings (as integers and various word formats are often small) and only when
+those strings will be thrown away shortly after reading. Support for zero copy
+should be considered medium-low priority; it is desirable, but requires nuance
+and testing to get right.
+****
+
+== Formats
+
+Many Muffins supports a number of input and output types.
+
+Quite many formats are already supported, so more are going to require a
+compelling use case.
+
+=== Flat Buffers
+
+ - Automatic creation of vtables through macros
+ - Automatic serialization of objects through macros
+ - Helpers for reading flat buffer data manually
+ - Helpers for writing flat buffer data manually
+
+****
+Flat buffers were the first format to have support written for them. This was when the project was named "skflatbuffers" and they seemed like an idyllic storage format.
+
+Flat Buffers excel when you can pre-allocate a region of memory, shove
+your objects there, and pre-calculate the virtual tables and offsets ahead of
+time. Doing so allows your "encode" and "decode" steps to be simple blits.
+This does not play well with Nim's GC; for the same reasons we do not yet
+support zero copy decoding are why we also do not support this use case. It is
+a desirable one especially for very busy servers or constrainted hardware, but
+requires some supporting materials to use well.
+****
+
+NOTE: Flat Buffers lose compression efficacy as the total amount of data
+increases. This format contains many indexes which for all intents and
+purposes amount to "random data." Some users online have claimed that a
+gzipped JSON file is actually _smaller_ than a compressed Flat Buffer. You may
+need to weigh your CPU vs. Bandwidth needs against your specific data set.
+
+=== Flex Buffers
+
+ - Not started
+
+These are the "schemaless" little brothers of Flat Buffers. They are a little
+more lenient, and read slightly more like a binary version of JSON.
+
+=== Protocol Buffers
+
+ - Helpers for writing protobufs manually
+ - Automatic serialization of objects through macros
+
+All fields which are to be serialized require the `pbkey` pragma. It takes
+place of the field tag in a `.proto` specification file. Fields missing the
+`pbkey` pragma *will be ignored* during reading and writing steps.
+
+.Using the `pbkey` pragma
+====
+[source,nim]
+----
+type
+  MyObject* = object
+    foo* {.pbkey: 1.}: string
+----
+====
+
+=== Msgpack
+
+ - Not started
+
+====
+
+Msgpack is supported by Redis and used by Fluentd. It represents a 1:1 mapping to JSON, but is provided purely in binary form as opposed to textual. 
+
+====
+
+=== CBOR
+
+ - Not started
+
+====
+
+Concise Binary Object Notation is, like Msgpack, based on JSON. It is a format which is formally specified by an IETF RFC, used in another spec (CoAP), and intended for use by "internet of things" devices and smart grids.
+
+====
+
+=== TOML
+
+ - Not started; low priority
+
+====
+TOML is the preferred interchange format for the Godot game engine. They
+previously tried binary and XML formats for storing scenes and asset data, and
+have (as of 2018) settled on TOML. TOML reads like a Windows INI format, with
+a little extra markup to support JSON-like complexities. Unlike JSON, data is
+broken up in to lines which are easier for human text editing as well as
+playing nice with version control such as Git.
+
+Implementation requires text and syntax parsing; such is much more complicated
+than the binary formats offered here.
+====
+
+=== Capnproto
+
+ - Not started; very low priority
+
+====
+Capnproto is the preferred interchange format for the Sandstorm project, a
+container middleware which sandboxes self-hosted web applications.
+====
+
+NOTE: How fields are packed and aligned is incompletely specified. Support
+would require diving in to C/C++ code and maintaining crossbar tests in case
+something changed upstream. This is significantly more aggravating and
+maintenence intensive than other formats here which are fully specified by
+their authors.
+
+=== JSON
+
+ - Not started; very low priority
+
+====
+Nim's standard library already provides JSON code.  Not considered a priority
+unless for some reason the existing JSON code is found to be deficient.
+====
