@@ -1,5 +1,5 @@
 
-import math, macros, typetraits, streams, skmmutils
+import macros, typetraits, streams, skmmutils
 
 type
   uoffset* = uint32           ## offset in to the buffer
@@ -42,7 +42,10 @@ macro flatbuffer_embedded_sizeof*(typ: typed): int =
   ## Checks the size of this datatype when inlined in to the flat buffer. A
   ## size of zero means the type cannot be inlined. Due to bugs with generics
   ## in 0.18, this is a hard coded table of known-good types.
-  return flatbuffer_embedded_sizeof_str($typ)
+  when (NimMajor, NimMinor) >= (1, 0):
+    newLit flatbuffer_embedded_sizeof_str($typ)
+  else:
+    flatbuffer_embedded_sizeof_str($typ)
 
 template add*(self: var Vtable; typ: typed) =
   ## Convenience template for adding a type to a virtual table.
@@ -52,7 +55,7 @@ proc add*(self: var Vtable; embed_size: int) =
   ## Less convenient procedure for adding to a virtual table, including size of embedded value.
 
   inc self.struct_size, soffset.sizeof
-  
+
   # technically something that was not embedded is instead pointed to, so the pointer itself is embedded.
   if embed_size == 0:
     inc self.embed_size, uint16.sizeof
@@ -60,8 +63,9 @@ proc add*(self: var Vtable; embed_size: int) =
     inc self.embed_size, embed_size
 
   self.alignment_size = max(self.alignment_size, embed_size)
-  if self.offsets == nil:
-    newseq(self.offsets, 0)
+  when (NimMajor, NimMinor) < (1, 0):
+    if self.offsets == nil:
+      newseq(self.offsets, 0)
   self.offsets.add(0)
 
 template `[]=`*(self: Vtable; index: int; offset: voffset) =
@@ -100,6 +104,12 @@ proc writeFB* (s: Stream; str: string) =
   s.write(str)
   s.write(0.uint8) # implicit null terminator; required by spec
 
+proc writeFB* [T](s: Stream; q: seq[T]) =
+  s.write(q.len.uint32)
+  for item in items q:
+    s.write(item)
+  s.write(0.uint8) # implicit null terminator; required by spec
+
 proc writeFB* (s: Stream; b: pointer; bs: int) =
   s.write(bs.uint32)
   s.writeData(b, bs)
@@ -111,7 +121,7 @@ proc writeFB* (s: Stream; b: pointer; bs: int) =
 proc readFBString* (s: Stream): string =
   ## NB: This procedure does not involve a read limit; specially crafted
   ## inputs could request all available memory be allocated.
-  
+
   var slen = s.readUint32().int
   result = s.readStr(slen).string
   discard s.readUint8() # implicit null terminator; required by spec
@@ -209,8 +219,8 @@ macro autoFlatbuffersFor* (x: typed): untyped =
 
   var vtable_size = int16.sizeof * 2
   var table_size = int32.sizeof
-  for name, sym in fields(x.symbol.getImpl()):
-    let embed_size = flatbuffer_embedded_sizeof_str($sym)
+  for name, sym, _ in fields(x.symbol.getImpl()):
+    let embed_size = flatbuffer_embedded_sizeof_str(repr sym)
     inc vtable_size, int16.sizeof
     if embed_size > 0:
       inc table_size, embed_size
@@ -218,15 +228,15 @@ macro autoFlatbuffersFor* (x: typed): untyped =
       inc table_size, int16.sizeof
 
   # iterate fields and write everything we cannot embed
-  for name, sym in fields(x.symbol.getImpl()):
-    let embed_size = flatbuffer_embedded_sizeof_str($sym)
+  for name, sym, _ in fields(x.symbol.getImpl()):
+    let embed_size = flatbuffer_embedded_sizeof_str(repr sym)
     if embed_size == 0:
       let marker = newLetStmt(gensym(), newCall(sgetPosition, istream))
       marks.add(marker)
       writebody.add(marker)
       writebody.add(newCall(swritefb, istream, newDotExpr(iself, name)))
 
-  # write the pointer to our vtable 
+  # write the pointer to our vtable
   let table_marker = gensym()
   writebody.add(newLetStmt(table_marker, newCall(sgetPosition, istream)))
   writebody.add(newCall(swrite, istream, newDotExpr(newLit(-table_size), sint32)))
@@ -234,8 +244,8 @@ macro autoFlatbuffersFor* (x: typed): untyped =
   # iterate fields and write references to unembedded data, and any data which
   # has been embedded
   var y = 0
-  for name, sym in fields(x.symbol.getImpl()):
-    let embed_size = flatbuffer_embedded_sizeof_str($sym)
+  for name, sym, _ in fields(x.symbol.getImpl()):
+    let embed_size = flatbuffer_embedded_sizeof_str(repr sym)
     if embed_size > 0:
       writebody.add(newCall(swritefbembed, istream, newDotExpr(iself, name)))
     else:
@@ -245,10 +255,10 @@ macro autoFlatbuffersFor* (x: typed): untyped =
   # now we must manufacture the vtable for this object
   writebody.add(newCall(swrite, istream, newDotExpr(newLit(vtable_size), sint16)))
   writebody.add(newCall(swrite, istream, newDotExpr(newLit(table_size), sint16)))
- 
+
   y = soffset.sizeof # skip the pointer to vtable
-  for name, sym in fields(x.symbol.getImpl()):
-    let embed_size = flatbuffer_embedded_sizeof_str($sym)
+  for name, sym, _ in fields(x.symbol.getImpl()):
+    let embed_size = flatbuffer_embedded_sizeof_str(repr sym)
     writebody.add(newCall(swrite, istream, newDotExpr(newLit(y), sint16)))
     if embed_size > 0:
       inc y, embed_size
@@ -275,7 +285,7 @@ when isMainModule:
       x: seq[int32]
 
   autoFlatbuffersFor(ThingDoer)
-  #autoFlatbuffersFor(ArrayDoer)
+  autoFlatbuffersFor(ArrayDoer)
 
   #var junitfile = newfilestream("skflatbuffer.xml", fmwrite)
   #var junit = newJUnitOutputFormatter(junitfile)
@@ -292,15 +302,15 @@ when isMainModule:
 
       s.writeFB(x)
 
-    # test "ArrayDoer":
-    #   var s = newFileStream("arraydoer.bin", fmWrite)
+    test "ArrayDoer":
+      var s = newFileStream("arraydoer.bin", fmWrite)
 
-    #   var x = ArrayDoer()
-    #   newSeq(x.x, 2)
-    #   x.x[0] = 500
-    #   x.x[1] = 900
+      var x = ArrayDoer()
+      newSeq(x.x, 2)
+      x.x[0] = 500
+      x.x[1] = 900
 
-    #   s.writeFB(x)
+      s.writeFB(x)
 
   #junit.close()
   #junitfile.flush()
